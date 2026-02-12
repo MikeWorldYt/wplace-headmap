@@ -12,6 +12,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from PIL import Image
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "DNT": "1",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Cookie": "_cfuvid=6ZtIVEk1rfvIqE50VL8t4YY6rzq1ADjkTAjWfbq7Ezo-1770920159.0875788-1.0.1.1-.FG_XDpXu69mv9RPxtOn_uzg5dTEq8dGjSSSlOIyRBU"
+}
+
 # ==========================
 # CONFIGURACIÓN
 # ==========================
@@ -43,7 +60,7 @@ DATA_JSON_PATH = os.path.join(OUTPUT_DIR, "data.json")
 HTML_PATH = os.path.join(OUTPUT_DIR, "index.html")
 
 BLOCK_SIZE = 10
-MAX_WORKERS = 10
+MAX_WORKERS = 8
 MIN_WORKERS = 1
 
 # ==========================
@@ -66,8 +83,9 @@ def rect_bounds(start, end):
 
 def fetch_pixel(tlx, tly, pxx, pxy):
     url = BASE_PIXEL_URL.format(tlx=tlx, tly=tly, px=pxx, py=pxy)
+    time.sleep(0.15 + random.random() * 0.25)
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, headers=HEADERS, timeout=10)
 
         if r.status_code == 404:
             print(f"[404] {tlx},{tly} px {pxx},{pxy}")
@@ -166,6 +184,7 @@ def block_already_done(bx, by):
 def process_block(bx, by, wx0, wy0, wx1, wy1, throttle):
     final_file = chunk_filename(bx, by)
     partial_file = partial_filename(bx, by)
+    time.sleep(0.5 + random.random() * 1.0)
 
     if os.path.exists(final_file):
         print(f"[SKIP] bloque {bx},{by} ya completado")
