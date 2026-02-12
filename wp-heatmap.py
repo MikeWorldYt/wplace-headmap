@@ -3,8 +3,11 @@
 
 import os
 import json
+import time
+import random
 from collections import defaultdict
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from PIL import Image
@@ -31,12 +34,17 @@ BASE_PIXEL_URL = "https://backend.wplace.live/s0/pixel/{tlx}/{tly}?x={px}&y={py}
 BASE_TILE_URL = "https://backend.wplace.live/files/s0/tiles/{tlx}/{tly}.png"
 
 OUTPUT_DIR = "output"
+CHUNKS_DIR = os.path.join(OUTPUT_DIR, "chunks")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CHUNKS_DIR, exist_ok=True)
 
 RECT_IMAGE_PATH = os.path.join(OUTPUT_DIR, "rect.png")
 DATA_JSON_PATH = os.path.join(OUTPUT_DIR, "data.json")
 HTML_PATH = os.path.join(OUTPUT_DIR, "index.html")
 
+BLOCK_SIZE = 10
+MAX_WORKERS = 10
+MIN_WORKERS = 1
 
 # ==========================
 # COORDENADAS
@@ -52,30 +60,35 @@ def rect_bounds(start, end):
     return wx0, wy0, wx1, wy1
 
 
-def pixel_iterator(start, end):
-    wx0, wy0, wx1, wy1 = rect_bounds(start, end)
-
-    for wy in range(wy0, wy1 + 1):
-        tly = wy // 1000
-        pxy = wy % 1000
-
-        for wx in range(wx0, wx1 + 1):
-            tlx = wx // 1000
-            pxx = wx % 1000
-
-            yield tlx, tly, pxx, pxy, wx, wy
-
-
 # ==========================
 # FETCH
 # ==========================
 
 def fetch_pixel(tlx, tly, pxx, pxy):
     url = BASE_PIXEL_URL.format(tlx=tlx, tly=tly, px=pxx, py=pxy)
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, timeout=10)
 
+        if r.status_code == 404:
+            print(f"[404] {tlx},{tly} px {pxx},{pxy}")
+            return "404"
+        if r.status_code == 429:
+            print(f"[429] RATE LIMIT en {tlx},{tly} px {pxx},{pxy}")
+            return "RATE_LIMIT"
+        if r.status_code >= 500:
+            print(f"[{r.status_code}] SERVER ERROR en {tlx},{tly} px {pxx},{pxy}")
+            return "SERVER_ERROR"
+        r.raise_for_status()
+        print(f"[OK] {tlx},{tly} px {pxx},{pxy}")
+        return r.json()
+
+    except requests.exceptions.Timeout:
+        print(f"[TIMEOUT] {tlx},{tly} px {pxx},{pxy}")
+        return "TIMEOUT"
+
+    except Exception as e:
+        print(f"[ERROR] {tlx},{tly} px {pxx},{pxy} -> {e}")
+        return "ERROR"
 
 def fetch_tile(tlx, tly):
     url = BASE_TILE_URL.format(tlx=tlx, tly=tly)
@@ -102,7 +115,6 @@ def build_rect_image(start, end, save_path):
 
     for tly in range(tly_min, tly_max + 1):
         for tlx in range(tlx_min, tlx_max + 1):
-
             try:
                 tile = fetch_tile(tlx, tly)
             except:
@@ -136,40 +148,150 @@ def build_rect_image(start, end, save_path):
 
 
 # ==========================
-# RECOLECCIÓN DE DATOS
+# BLOQUES / CHUNKS
 # ==========================
 
-def collect_data(start, end):
+def chunk_filename(bx, by):
+    return os.path.join(CHUNKS_DIR, f"chunk_{bx}_{by}.json")
+
+
+def partial_filename(bx, by):
+    return os.path.join(CHUNKS_DIR, f"chunk_{bx}_{by}.partial.json")
+
+
+def block_already_done(bx, by):
+    return os.path.exists(chunk_filename(bx, by))
+
+
+def process_block(bx, by, wx0, wy0, wx1, wy1, throttle):
+    final_file = chunk_filename(bx, by)
+    partial_file = partial_filename(bx, by)
+
+    if os.path.exists(final_file):
+        print(f"[SKIP] bloque {bx},{by} ya completado")
+        return final_file
+
+    # Cargar progreso parcial
+    partial_data = []
+    if os.path.exists(partial_file):
+        try:
+            with open(partial_file, "r", encoding="utf-8") as f:
+                partial_data = json.load(f)
+            print(f"[RESUME] bloque {bx},{by} retomando desde fila {len(partial_data)}")
+        except:
+            partial_data = []
+
+    rows_done = len(partial_data)
+    retry_count = 0
+
+    for row_index in range(rows_done, BLOCK_SIZE):
+        wy = by + row_index
+        if wy > wy1:
+            break
+
+        row_pixels = []
+
+        print(f"[ROW] bloque {bx},{by} procesando fila {row_index}")
+
+        for col in range(BLOCK_SIZE):
+            wx = bx + col
+            if wx > wx1:
+                break
+
+            tlx = wx // 1000
+            tly = wy // 1000
+            pxx = wx % 1000
+            pxy = wy % 1000
+
+            data = fetch_pixel(tlx, tly, pxx, pxy)
+
+            if data in ("RATE_LIMIT", "SERVER_ERROR", "TIMEOUT", "ERROR"):
+                print(f"[RETRY] bloque {bx},{by} fila {row_index} por {data}")
+                retry_count += 1
+                if retry_count >= 5:
+                    print(f"[FAILED] bloque {bx},{by} marcado como fallido")
+                    return "FAILED"
+                time.sleep(2)
+                return "RETRY"
+
+            if data == "404":
+                continue
+
+            pb = data.get("paintedBy") or {}
+            name = pb.get("name")
+            pid = pb.get("id")
+
+            if name and pid:
+                key = f"{name}#{pid}"
+                rx = wx - wx0
+                ry = wy - wy0
+                row_pixels.append({"x": rx, "y": ry, "painters": [key]})
+
+        partial_data.append(row_pixels)
+        with open(partial_file, "w", encoding="utf-8") as f:
+            json.dump(partial_data, f, ensure_ascii=False)
+
+        print(f"[SAVE] bloque {bx},{by} fila {row_index} guardada")
+
+    # Convertir a final
+    painter_counts = defaultdict(int)
+    pixel_map = []
+
+    for row in partial_data:
+        for p in row:
+            for key in p["painters"]:
+                painter_counts[key] += 1
+            pixel_map.append(p)
+
+    final_data = {
+        "painterCounts": dict(painter_counts),
+        "pixels": pixel_map,
+    }
+
+    with open(final_file, "w", encoding="utf-8") as f:
+        json.dump(final_data, f, ensure_ascii=False)
+
+    if os.path.exists(partial_file):
+        os.remove(partial_file)
+
+    print(f"[DONE] bloque {bx},{by} completado")
+    return final_file
+
+def collect_data_parallel(start, end):
+    wx0, wy0, wx1, wy1 = rect_bounds(start, end)
+
+    blocks = []
+    for by in range(wy0, wy1 + 1, BLOCK_SIZE):
+        for bx in range(wx0, wx1 + 1, BLOCK_SIZE):
+            blocks.append((bx, by))
+
+    print(f"[INFO] Bloques totales: {len(blocks)}")
+
+    throttle = {"requests": 0, "errors": 0, "error_rate": 0.0}
+
+    for bx, by in blocks:
+        print(f"[INFO] Procesando bloque {bx},{by}")
+
+        while True:
+            result = process_block(bx, by, wx0, wy0, wx1, wy1, throttle)
+            if result != "RETRY":
+                break
+
+    # Fusionar chunks
     painter_counts = defaultdict(int)
     pixel_map = defaultdict(set)
 
-    wx0, wy0, wx1, wy1 = rect_bounds(start, end)
-    total = (wx1 - wx0 + 1) * (wy1 - wy0 + 1)
-    processed = 0
-
-    for tlx, tly, pxx, pxy, wx, wy in pixel_iterator(start, end):
-        processed += 1
-        if processed % 1000 == 0:
-            print(f"[INFO] {processed}/{total}")
-
-        try:
-            data = fetch_pixel(tlx, tly, pxx, pxy)
-        except:
+    for fname in os.listdir(CHUNKS_DIR):
+        if not fname.endswith(".json"):
             continue
+        with open(os.path.join(CHUNKS_DIR, fname), "r", encoding="utf-8") as f:
+            cdata = json.load(f)
 
-        pb = data.get("paintedBy", {})
-        name = pb.get("name")
-        pid = pb.get("id")
+        for k, c in cdata["painterCounts"].items():
+            painter_counts[k] += c
 
-        if not name or not pid:
-            continue
-
-        key = f"{name}#{pid}"
-        painter_counts[key] += 1
-
-        rx = wx - wx0
-        ry = wy - wy0
-        pixel_map[(rx, ry)].add(key)
+        for p in cdata["pixels"]:
+            pixel_map[(p["x"], p["y"])].add(p["painters"][0])
 
     return painter_counts, pixel_map
 
@@ -218,8 +340,9 @@ def export_html(path):
 <style>
 body { font-family: sans-serif; display: flex; gap: 20px; }
 #container { position: relative; }
-#overlay { position: absolute; top:0; left:0; pointer-events:none; }
-#painter-list { max-height: 90vh; overflow-y:auto; list-style:none; padding:0; }
+#overlay { position: absolute; top:0; left:0; pointer-events:none; image-rendering: pixelated; }
+#base { image-rendering: pixelated; }
+#painter-list { max-height: 90vh; overflow-y:auto; list-style:none; padding:0; margin:0; }
 .painter-item { cursor:pointer; padding:3px; }
 .painter-item.selected { background:#007acc; color:white; }
 </style>
@@ -237,6 +360,7 @@ body { font-family: sans-serif; display: flex; gap: 20px; }
 let data = null;
 let selected = new Set();
 let ctx = null;
+let canvas = null;
 
 fetch("data.json").then(r=>r.json()).then(d=>{
     data = d;
@@ -245,7 +369,7 @@ fetch("data.json").then(r=>r.json()).then(d=>{
 
 function init(){
     const img = document.getElementById("base");
-    const canvas = document.getElementById("overlay");
+    canvas = document.getElementById("overlay");
     ctx = canvas.getContext("2d");
 
     img.onload = ()=>{
@@ -277,12 +401,11 @@ function renderList(){
 }
 
 function draw(){
-    ctx.clearRect(0,0,ctx.canvas.width,ctx.canvas.height);
-
+    ctx.clearRect(0,0,canvas.width,canvas.height);
     if(selected.size === 0) return;
 
     ctx.fillStyle = "rgba(0,0,0,0.5)";
-    ctx.fillRect(0,0,ctx.canvas.width,ctx.canvas.height);
+    ctx.fillRect(0,0,canvas.width,canvas.height);
 
     ctx.fillStyle = "rgba(255,0,0,0.9)";
     data.pixels.forEach(p=>{
@@ -301,7 +424,6 @@ function draw(){
 """
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
-
     print("[OK] index.html generado")
 
 
@@ -313,8 +435,8 @@ def main():
     print("[1] Generando imagen del rectángulo…")
     build_rect_image(START, END, RECT_IMAGE_PATH)
 
-    print("[2] Recolectando datos…")
-    painter_counts, pixel_map = collect_data(START, END)
+    print("[2] Recolectando datos en bloques con auto‑throttle…")
+    painter_counts, pixel_map = collect_data_parallel(START, END)
 
     print("[3] Exportando JSON…")
     export_json(START, END, painter_counts, pixel_map, DATA_JSON_PATH)
